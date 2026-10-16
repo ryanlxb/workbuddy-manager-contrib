@@ -12,6 +12,7 @@ import os
 import re
 import tempfile
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1078,6 +1079,32 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     _dt = device_token_for(auth)
     if _dt:
         headers['X-Device-Token'] = _dt
+    # 会话头族（对齐上游 ChatHeaders → injectConversationHeaders）。
+    #
+    # 为什么必须有：上游 2026-10-16 起对**国际版**出站做渠道校验，点名要
+    # `X-Conversation-ID`——缺它就返回 400 code=11128 "conversation id missing"，
+    # displayTips 写着「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+    # 只往 body 里塞 conversationId 无效，校验对象是头族（issue #193 的生产实证、
+    # ardeyouxipianyi/workbuddy2api-hub#381 对官方客户端 5.8.4 的抓包、
+    # CangShui/workbuddy-gateway#20 的 A/B）。这条探测此前一个会话头都没带，
+    # 于是形态问题被误读成「账号不可用」。
+    #
+    # 取值口径照抓包：会话 id 是带连字符的 UUID，请求/消息 id 是 32 位 hex；
+    # `X-Conversation-Request-ID` 与 `X-Root-Request-ID` 同值、
+    # `X-Conversation-Message-ID` 与 `X-Request-ID` 同值（两对互不相等）。
+    # 探测是一次性请求、没有「同一会话多轮」的语义，故现生成，不做派生。
+    _conv_id = str(uuid.uuid4())
+    _conv_req_id = uuid.uuid4().hex
+    _msg_id = uuid.uuid4().hex
+    headers['X-Conversation-ID'] = _conv_id
+    headers['X-Conversation-Request-ID'] = _conv_req_id
+    headers['X-Root-Request-ID'] = _conv_req_id
+    headers['X-Trace-ID'] = _conv_req_id
+    headers['X-Conversation-Message-ID'] = _msg_id
+    headers['X-Request-ID'] = _msg_id
+    headers['X-B3-TraceId'] = _conv_req_id
+    headers['X-B3-SpanId'] = _msg_id[:16]
+    headers['X-B3-Sampled'] = '1'
 
     payload = {
         'model': model,

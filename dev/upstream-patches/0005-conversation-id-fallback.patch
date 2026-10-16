@@ -1,0 +1,376 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 5ec741e..f37d9a1 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -639,8 +639,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	// 是服务端指令，走本网关的客户端不属于该形态）。此处**轮转循环外**生成一次，
+ 	// 循环内每次出站原样复用 → 换号/重试/降级全部同 ID，后台不再碎片化（此前网关
+ 	// 一个都不发，上游按 HTTP 请求逐条记账，同一对话几十上百个 RequestID）。
+-	//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造，见
+-	//     ResolveConversationID；官方后台不校验一致，空会话则不建立聚合键）；
++	//   - conversationID：body 提取优先（透传客户端原值）；客户端没给则按会话键
++	//     稳定派生，**不再留空**（见下方 convID 处的说明）；
+ 	//   - conversationRequestID：入站 X-Conversation-Request-ID 透传优先（客户端已
+ 	//     有自己的对话轮 ID 则以客户端为准）。派生分两态：
+ 	//     * turnKey 非空（有末条 user 消息）→ 带会话键客户端走 TurnRequestID(
+@@ -652,7 +652,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
+ 	//       一次即共享。
+ 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
+-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
++	// 会话 ID（X-Conversation-ID）：客户端给了就透传；没给则按会话键**稳定派生**
++	// （同一会话多轮恒同值）。
++	//
++	// 为什么不能留空：上游国际版 2026-10-16 起对出站做渠道校验，缺
++	// X-Conversation-ID 的请求被拦 400 code=11128 "conversation id missing"
++	// （displayTips：这次调用没通过渠道校验）。三方实证——issue #193 的生产池、
++	// workbuddy2api-hub#381 对官方客户端 5.8.4 的抓包、CangShui/workbuddy-gateway#20
++	// 的 A/B；且实测只在 body 加 conversationId 无效，校验对象是头族。
++	// 旧口径「不伪造」（ResolveConversationID 只认 body）在渠道校验上线后已不成立。
++	//
++	// 派生键取 stickyKey（sessKey → StickyFallbackKey），与粘性路由同源：
++	//   - 同一会话多轮恒同值（会话级语义，与 RequestIDForKey 一致）；
++	//   - **与账号无关**：换号/重试/降级不改会话 ID，与 X-Conversation-Request-ID
++	//     的既有口径一致（会话 ID 也不该随轮转漂移）；
++	//   - stickyKey 取自改写前的 body —— 会话身份不应随提示词改写而变。
++	// 无会话键也无可用消息（残留空态）时留空，由 ChatHeaders 兜底现生成。
++	convID := session.ResolveConversationID(body)
++	if convID == "" && stickyKey != "" {
++		convID = session.ConversationIDForKey(stickyKey)
++	}
++	chatMeta := upstream.ChatMeta{ConversationID: convID}
+ 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
+ 		chatMeta.ConversationRequestID = v
+ 	} else if turnKey != "" && sessKey != "" {
+diff --git a/internal/server/handler_ids_test.go b/internal/server/handler_ids_test.go
+index c20e50f..8670f10 100644
+--- a/internal/server/handler_ids_test.go
++++ b/internal/server/handler_ids_test.go
+@@ -4,6 +4,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"regexp"
+ 	"strings"
+ 	"testing"
+ 
+@@ -137,6 +138,62 @@ func TestChatConversationIDPassthrough(t *testing.T) {
+ 	}
+ }
+ 
++// TestChatConversationIDDerivedStableWithoutClientID 客户端不带 conversationId
++// （OpenAI 兼容客户端——Codex / Cherry Studio 等的常态）时，出站 X-Conversation-ID
++// 由会话键**稳定派生**：同一会话两次请求恒同值、不同会话不同值、形态是带连字符
++// 的 UUIDv4。
++//
++// 为什么必须有：上游国际版 2026-10-16 起对出站做渠道校验，缺这个头即
++// 400 code=11128 "conversation id missing"（issue #193 生产实证、hub#381 抓包、
++// CangShui#20 A/B）。此前该头在客户端不给时直接**不发**——正是被拦的形态。
++func TestChatConversationIDDerivedStableWithoutClientID(t *testing.T) {
++	var captured []http.Header
++	up := &upstream.Client{
++		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
++			captured = append(captured, r.Header.Clone())
++			return &http.Response{
++				StatusCode: 200,
++				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
++				Body:       io.NopCloser(strings.NewReader(sseOK)),
++			}, nil
++		})},
++		ChatBaseCN:    "https://fake.example",
++		BillingBaseCN: "https://fake.example",
++	}
++	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
++	h := NewHandler(Config{Pool: p, Upstream: up})
++
++	send := func(userText string) {
++		t.Helper()
++		body := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"` + userText + `"}]}`
++		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
++		rec := httptest.NewRecorder()
++		h.ServeHTTP(rec, req)
++		if rec.Code != 200 {
++			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
++		}
++	}
++
++	send("同一个开场白")
++	send("同一个开场白")
++	send("另一个开场白")
++
++	if len(captured) != 3 {
++		t.Fatalf("captured %d outbound requests, want 3", len(captured))
++	}
++	convIDRe := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
++	first := captured[0].Get("X-Conversation-ID")
++	if !convIDRe.MatchString(first) {
++		t.Fatalf("X-Conversation-ID=%q want hyphenated UUIDv4 (缺失即上游 11128)", first)
++	}
++	if got := captured[1].Get("X-Conversation-ID"); got != first {
++		t.Errorf("同会话第二次出站 X-Conversation-ID=%q want %q（会话级应多轮稳定）", got, first)
++	}
++	if got := captured[2].Get("X-Conversation-ID"); got == first {
++		t.Errorf("不同会话出站 X-Conversation-ID 相同（%q）——应各自独立", got)
++	}
++}
++
+ // TestChatConversationRequestIDInboundPassthrough 入站自带 X-Conversation-Request-ID →
+ // 出站原样透传（客户端已有自己的对话轮 ID 时以客户端为准）。
+ func TestChatConversationRequestIDInboundPassthrough(t *testing.T) {
+diff --git a/internal/session/ids.go b/internal/session/ids.go
+index 08a32cc..abec596 100644
+--- a/internal/session/ids.go
++++ b/internal/session/ids.go
+@@ -223,3 +223,47 @@ func TurnRequestID(turnKey string) string {
+ 	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
+ 	return hex.EncodeToString(sum[:16])
+ }
++
++// formatUUIDv4 把 16 字节按 RFC 4122 打成带连字符的 UUID 文本（8-4-4-4-12 小写
++// hex），并置上 v4 版本位与变体位。会话 ID 用这个形态，消息/请求 ID 用 32 hex
++// （NewMessageID）——两种形态在官方客户端抓包里并存，各司其职（见 ConversationIDForKey）。
++func formatUUIDv4(b []byte) string {
++	b[6] = (b[6] & 0x0f) | 0x40 // version 4
++	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
++	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
++}
++
++// NewConversationID 生成一次性的会话 ID（带连字符的 UUIDv4 形态）。
++// 只在「无会话键可派生」时兜底用；有会话键一律走 ConversationIDForKey，
++// 以保住「同一会话多轮恒同值」的语义。
++func NewConversationID() string {
++	b := make([]byte, 16)
++	if _, err := cryptorand.Read(b); err != nil {
++		// 熵源故障的极端兜底：仍保证 16 字节有熵且形态合法（不 panic、不空串）。
++		n := uint64(rand.Uint64()) | 1
++		for i := 0; i < 8; i++ {
++			b[i] = byte(n >> (i * 8))
++			b[15-i] = byte(n >> ((7 - i) * 8))
++		}
++	}
++	return formatUUIDv4(b)
++}
++
++// ConversationIDForKey 返回会话键的稳定 conversation ID：sha256(盐|键) 前 16 字节，
++// 按 UUIDv4 形态格式化（与 RequestIDForKey / TurnRequestID 共用同一派生盐）。
++//   - 同 key：进程内恒派生同值 —— 同一会话多轮恒同值（X-Conversation-ID 的会话级语义）；
++//   - 异 key：各自独立，互不相同；
++//   - 空 key：返回一次性随机值（无会话可归属时不伪造「稳定」）。
++//
++// 形态为什么是带连字符的 UUID 而不是 32 hex：上游国际版 2026-10-16 起对出站做
++// 渠道校验，`X-Conversation-ID` 是点名要的字段之一；官方客户端抓包（5.8.4，约
++// 350 条，见 ardeyouxipianyi/workbuddy2api-hub#381）里会话 id 正是带连字符的
++// UUID（v4/v7 均被接受，版本号不参与校验），而消息/请求 id 是 32 hex。两种形态
++// 保持各自原貌最不惹眼。
++func ConversationIDForKey(key string) string {
++	if key == "" {
++		return NewConversationID()
++	}
++	sum := sha256.Sum256([]byte(deriveSalt + "|" + key))
++	return formatUUIDv4(sum[:16])
++}
+diff --git a/internal/session/ids_test.go b/internal/session/ids_test.go
+index 5fb9006..bac4604 100644
+--- a/internal/session/ids_test.go
++++ b/internal/session/ids_test.go
+@@ -3,6 +3,7 @@ package session
+ import (
+ 	"crypto/sha256"
+ 	"encoding/hex"
++	"regexp"
+ 	"strings"
+ 	"testing"
+ )
+@@ -146,3 +147,54 @@ func TestTurnRequestIDDerivation(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// convUUIDRe 带连字符 UUIDv4 的合法格式（版本位 4、变体位 8/9/a/b）。
++var convUUIDRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
++
++// TestConversationIDForKeyDerivation 会话 ID 是纯派生：同键恒同值（同一会话多轮
++// 恒同值）、异键异值、空键每次新值、形态恒为带连字符的 UUIDv4。
++//
++// 形态为什么必须是 UUID 而不是 32 hex：上游国际版 2026-10-16 起对出站做渠道校验，
++// 点名要 X-Conversation-ID；官方客户端抓包（5.8.4，约 350 条）里会话 id 是带连
++// 字符的 UUID，消息/请求 id 才是 32 hex（workbuddy2api-hub#381）。两种形态在抓包
++// 里并存，各保持原貌最不惹眼。
++func TestConversationIDForKeyDerivation(t *testing.T) {
++	a1 := ConversationIDForKey("会话键-1")
++	a2 := ConversationIDForKey("会话键-1")
++	if a1 != a2 {
++		t.Errorf("same session key should derive same id: %q vs %q", a1, a2)
++	}
++	b := ConversationIDForKey("会话键-2")
++	if b == a1 {
++		t.Errorf("different session keys should derive different ids: %q", b)
++	}
++	// 与聚合键族的派生互不串味：同一键下会话 ID 不能等于会话/轮级聚合 ID。
++	if RequestIDForKey("会话键-1") == a1 {
++		t.Error("conversation id collides with session-level request id")
++	}
++	// 空键：无会话可归属 → 每次新值，且仍是合法形态。
++	e1, e2 := ConversationIDForKey(""), ConversationIDForKey("")
++	if e1 == e2 {
++		t.Errorf("empty key should yield fresh values each call: %q", e1)
++	}
++	for _, id := range []string{a1, b, e1, e2, NewConversationID()} {
++		if !convUUIDRe.MatchString(id) {
++			t.Errorf("conversation id %q is not a valid hyphenated UUIDv4", id)
++		}
++	}
++}
++
++// TestConversationIDForKeyIsAccountAgnostic 派生只吃会话键、不吃账号：同一会话
++// 在换号/重试/降级时出站会话 ID 必须一致（与 X-Conversation-Request-ID 的既有
++// 口径相同）。这里以「同键两次派生恒同值」锁定该性质——派生函数没有账号入参，
++// 有账号入参就会破坏它。
++func TestConversationIDForKeyIsAccountAgnostic(t *testing.T) {
++	key := "u0:同一会话"
++	seen := map[string]bool{}
++	for i := 0; i < 8; i++ {
++		seen[ConversationIDForKey(key)] = true
++	}
++	if len(seen) != 1 {
++		t.Errorf("conversation id should be stable across calls, got %d distinct values", len(seen))
++	}
++}
+diff --git a/internal/upstream/headers.go b/internal/upstream/headers.go
+index 1fee48b..8ed73a0 100644
+--- a/internal/upstream/headers.go
++++ b/internal/upstream/headers.go
+@@ -207,7 +207,7 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
+ // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
+ // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
+ type ChatMeta struct {
+-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
++	ConversationID        string // X-Conversation-ID：会话级；客户端透传值优先，空则由 handler 按会话键稳定派生（必发）
+ 	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
+ 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+ }
+@@ -268,8 +268,9 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
+ 
+ // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
+ // 头族分四层，各司其职：
+-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
+-//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
++//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId，或由 handler
++//     按会话键稳定派生）。**必发**——上游国际版 2026-10-16 起的渠道校验点名要它，
++//     缺失即 400 code=11128 "conversation id missing"；空值兜底见下方实现。
+ //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
+ //     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）；
+ //     换 user 消息即换键（#170 统一轮级，对齐官方 CLI 的 USER_PROMPT_SUBMIT 重生成
+@@ -288,9 +289,23 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+ 		convReqID = session.NewMessageID()
+ 	}
+ 	messageID := session.NewMessageID()
+-	if meta.ConversationID != "" {
+-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+-	}
++	// X-Conversation-ID：会话级。上层（handler）给了就透传、并已按会话键稳定
++	// 派生过；走到这里仍为空说明没有可归属的会话（无会话键也无可用消息），
++	// 现生成一个——**这个头必须发出去**。
++	//
++	// 口径变更（2026-10-16）：旧注释写的是「客户端没给就不伪造」，理由是不误导
++	// 后台建错会话。但上游国际版新增渠道校验后，**缺这个头是确定性被拦**：
++	// 400 code=11128 "conversation id missing"，displayTips 写着「这次调用没通过
++	// 渠道校验，可能不是官方客户端发出的」。两害相权，多发一个头远轻于必拦。
++	// 实证：issue #193 生产池（修复后逐号全绿）、workbuddy2api-hub#381 对官方
++	// 客户端 5.8.4 的抓包、CangShui/workbuddy-gateway#20 的 A/B（同凭据同 body，
++	// 缺 X-Conversation-* 恒 400、带齐恒 200）。且实测**只在 body 加
++	// conversationId 无效**——校验对象是头族。
++	convID := meta.ConversationID
++	if convID == "" {
++		convID = session.NewConversationID()
++	}
++	req.Header.Set("X-Conversation-ID", convID)
+ 	req.Header.Set("X-Conversation-Request-ID", convReqID)
+ 	req.Header.Set("X-Conversation-Message-ID", messageID)
+ 	req.Header.Set("X-Request-ID", messageID)
+diff --git a/internal/upstream/headers_ids_test.go b/internal/upstream/headers_ids_test.go
+index 28c4601..c7f668e 100644
+--- a/internal/upstream/headers_ids_test.go
++++ b/internal/upstream/headers_ids_test.go
+@@ -11,6 +11,11 @@ import (
+ var hex32Re = regexp.MustCompile(`^[0-9a-f]{32}$`)
+ var hex16Re = regexp.MustCompile(`^[0-9a-f]{16}$`)
+ 
++// uuidRe 带连字符 UUIDv4 的合法格式（8-4-4-4-12，版本位 4、变体位 8/9/a/b）——
++// X-Conversation-ID 的形态断言。官方客户端抓包里会话 id 就是这个形态
++// （v4/v7 均被上游接受，版本号不参与校验，见 workbuddy2api-hub#381）。
++var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
++
+ // TestChatHeadersConversationFullMeta 全量 meta 出站头族（issue #35 后台聚合）：
+ // 聚合主键 X-Conversation-Request-ID 必发且等于传入值，消息级双头同值 32 hex，
+ // X-Root-Request-ID = conversationRequestID，Trace 透传入站值，B3 链路族格式合法，
+@@ -60,16 +65,21 @@ func TestChatHeadersConversationFullMeta(t *testing.T) {
+ 	}
+ }
+ 
+-// TestChatHeadersConversationNoConvID meta.ConversationID 为空 → 不发 X-Conversation-ID
+-// （透传客户端原值优先，不伪造），其余头族照常。
++// TestChatHeadersConversationNoConvID meta.ConversationID 为空 → **仍必发**
++// X-Conversation-ID（现生成一个合法 UUIDv4），其余头族照常。
++//
++// 口径变更（2026-10-16）：此前断言「空则不发」（透传优先、不伪造）。上游国际版
++// 新增渠道校验后，缺这个头是确定性被拦——400 code=11128 "conversation id
++// missing"，实测只在 body 加 conversationId 无效（issue #193 / hub#381 /
++// CangShui#20 三方实证）。故「不发」让位于「必发」。
+ func TestChatHeadersConversationNoConvID(t *testing.T) {
+ 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+ 	req := mustRequest(t)
+ 	c := &Client{}
+ 	c.ChatHeaders(req, a, "", ChatMeta{ConversationRequestID: "convreq-1"})
+ 
+-	if got := req.Header.Get("X-Conversation-ID"); got != "" {
+-		t.Errorf("X-Conversation-ID = %q want empty (client didn't send one)", got)
++	if got := req.Header.Get("X-Conversation-ID"); !uuidRe.MatchString(got) {
++		t.Errorf("X-Conversation-ID = %q want UUIDv4 (必发：缺失即上游 11128)", got)
+ 	}
+ 	if got := req.Header.Get("X-Conversation-Request-ID"); got != "convreq-1" {
+ 		t.Errorf("X-Conversation-Request-ID = %q want convreq-1", got)
+@@ -79,8 +89,30 @@ func TestChatHeadersConversationNoConvID(t *testing.T) {
+ 	}
+ }
+ 
+-// TestChatHeadersConversationEmptyMeta 零值 meta（如测试/直接调用方）也必发聚合主键：
+-// conversationRequestID 内部补一个 NewMessageID（32 hex），B3 TraceId 取其值。
++// TestChatHeadersConversationIDNotReusedAcrossCalls 兜底值必须逐次现生成：
++// meta 为空时两次出站不能是同一个会话 ID（复用会把互不相干的请求在上游侧
++// 并成同一会话）。稳定派生由 handler 负责，不在这一层。
++func TestChatHeadersConversationIDNotReusedAcrossCalls(t *testing.T) {
++	a := &auth.Auth{AccessToken: "at", UID: "u1"}
++	c := &Client{}
++	first := mustRequest(t)
++	c.ChatHeaders(first, a, "", ChatMeta{})
++	second := mustRequest(t)
++	c.ChatHeaders(second, a, "", ChatMeta{})
++
++	a1 := first.Header.Get("X-Conversation-ID")
++	a2 := second.Header.Get("X-Conversation-ID")
++	if !uuidRe.MatchString(a1) || !uuidRe.MatchString(a2) {
++		t.Fatalf("两次出站都应是合法 UUIDv4：%q / %q", a1, a2)
++	}
++	if a1 == a2 {
++		t.Errorf("两次出站复用同一会话 ID %q（应逐次现生成）", a1)
++	}
++}
++
++// TestChatHeadersConversationEmptyMeta 零值 meta（如测试/直接调用方）也必发聚合主键
++// 与会话 ID：conversationRequestID 内部补一个 NewMessageID（32 hex），B3 TraceId 取其值；
++// X-Conversation-ID 现生成一个 UUIDv4（上游渠道校验点名要它）。
+ func TestChatHeadersConversationEmptyMeta(t *testing.T) {
+ 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+ 	req := mustRequest(t)
+@@ -97,8 +129,8 @@ func TestChatHeadersConversationEmptyMeta(t *testing.T) {
+ 	if got := req.Header.Get("X-B3-TraceId"); got != convReqID {
+ 		t.Errorf("X-B3-TraceId = %q want %q", got, convReqID)
+ 	}
+-	if got := req.Header.Get("X-Conversation-ID"); got != "" {
+-		t.Errorf("X-Conversation-ID = %q want empty", got)
++	if got := req.Header.Get("X-Conversation-ID"); !uuidRe.MatchString(got) {
++		t.Errorf("X-Conversation-ID = %q want UUIDv4 (零值 meta 也必发)", got)
+ 	}
+ }
+ 

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -368,6 +369,77 @@ class AttributionFingerprintTest(_Base):
         self.assertEqual(h.get('X-Agent-Purpose'), 'conversation')
         self.assertEqual(h.get('X-IDE-Name'), 'WorkBuddy')
         self.assertEqual(h.get('X-IDE-Version'), realm.client_version())
+
+
+# 官方客户端 5.8.4 抓包形态（workbuddy2api-hub#381）：会话 id 是带连字符的
+# UUID，请求/消息 id 是 32 位小写 hex。
+_UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+_HEX32_RE = re.compile(r'^[0-9a-f]{32}$')
+
+
+class ProbeConversationHeaderTest(_Base):
+    """探测请求必须带会话头族 —— 上游 2026-10-16 起国际版按渠道校验拦 11128。
+
+    现象：国际版账号探测恒报 `code=11128 "conversation id missing"`，
+    displayTips 写着「这次调用没通过渠道校验，可能不是官方客户端发出的」。
+    根因不是账号坏，而是**出站请求一个会话头都没带**——上游点名要
+    `X-Conversation-ID`，且校验对象是头族而非 body 里的 conversationId
+    （issue #193 的生产实证、hub#381 的官方客户端抓包、CangShui#20 的 A/B）。
+
+    这些缺口**不会报错**（对照本文件开头那句）：国际版被拦时才现形，国内版
+    眼下照样返回 200。所以只能在这里逐条钉死。
+    """
+
+    CN_AUTH = {'access_token': 'TOK', 'uid': 'u1', 'realm': 'cn'}
+    GLOBAL_AUTH = {'access_token': 'TOK', 'uid': 'u1', 'realm': 'global'}
+
+    def _probe_headers(self, auth: dict) -> dict:
+        _run(tencent.probe_account(auth, 'glm-5.2'))
+        return self._last()[2]['headers']
+
+    def test_conversation_family_present_for_global(self) -> None:
+        """国际版：五件套齐发，缺一件就可能被渠道校验拦下。"""
+        h = self._probe_headers(self.GLOBAL_AUTH)
+        for name in ('X-Conversation-ID', 'X-Conversation-Request-ID',
+                     'X-Conversation-Message-ID', 'X-Root-Request-ID', 'X-Request-ID'):
+            self.assertIn(name, h, f'{name} 缺失 —— 国际版会被判「非官方客户端」')
+
+    def test_conversation_family_present_for_cn(self) -> None:
+        """国内版同形发出：上游侧校验按账号灰度推进，形态不能等到被拦才补。"""
+        h = self._probe_headers(self.CN_AUTH)
+        self.assertIn('X-Conversation-ID', h)
+        self.assertIn('X-Conversation-Request-ID', h)
+
+    def test_shapes_match_official_client(self) -> None:
+        """取值形态照抓包：会话 id 带连字符，请求/消息 id 是 32 位 hex。"""
+        h = self._probe_headers(self.GLOBAL_AUTH)
+        self.assertRegex(h['X-Conversation-ID'], _UUID_RE)
+        self.assertRegex(h['X-Conversation-Request-ID'], _HEX32_RE)
+        self.assertRegex(h['X-Conversation-Message-ID'], _HEX32_RE)
+
+    def test_pairs_share_values_across_two_groups(self) -> None:
+        """抓包口径：Request-ID 与 Root-Request-ID 同值、Message-ID 与
+        X-Request-ID 同值，两对之间互不相等（会话轮 vs 消息）。"""
+        h = self._probe_headers(self.GLOBAL_AUTH)
+        self.assertEqual(h['X-Conversation-Request-ID'], h['X-Root-Request-ID'])
+        self.assertEqual(h['X-Conversation-Message-ID'], h['X-Request-ID'])
+        self.assertNotEqual(h['X-Conversation-Request-ID'], h['X-Conversation-Message-ID'])
+
+    def test_b3_chain_follows_gateway(self) -> None:
+        """链路族与上游 injectConversationHeaders 同口径：
+        TraceId 取会话轮 id，SpanId 取消息 id 前 16 位，恒采样。"""
+        h = self._probe_headers(self.GLOBAL_AUTH)
+        self.assertEqual(h['X-B3-TraceId'], h['X-Conversation-Request-ID'])
+        self.assertEqual(h['X-B3-SpanId'], h['X-Conversation-Message-ID'][:16])
+        self.assertEqual(h['X-B3-Sampled'], '1')
+        self.assertEqual(h['X-Trace-ID'], h['X-Conversation-Request-ID'])
+
+    def test_ids_are_regenerated_per_probe(self) -> None:
+        """两次探测的 id 必须不同：探测无「同一会话多轮」语义，复用会让
+        多个账号在上游侧共用同一个会话 id（是一条把账号池串起来的关联键）。"""
+        first = self._probe_headers(self.GLOBAL_AUTH)
+        second = self._probe_headers(self.GLOBAL_AUTH)
+        self.assertNotEqual(first['X-Conversation-ID'], second['X-Conversation-ID'])
 
 
 class ExpiringSoonFieldTest(unittest.TestCase):
